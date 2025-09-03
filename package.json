@@ -1,0 +1,24 @@
+{
+  "name": "copy-of-copy-of-ai-music-video-generator",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "@google/genai": "^1.16.0",
+    "@tensorflow/tfjs": "^4.20.0",
+    "@tensorflow-models/coco-ssd": "^2.2.3",
+    "@tensorflow-models/blazeface": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  }
+}
