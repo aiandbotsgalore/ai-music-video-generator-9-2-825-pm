@@ -1,18 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import type { EditDecision, AudioAnalysis, ClipMetadata, CreativeRationale } from "../types";
-
-let ai: GoogleGenAI | null = null;
-
-const getGenAI = (): GoogleGenAI => {
-  if (ai) return ai;
-  // Lazy init; caller is expected to configure environment/build to make this work.
-  const API_KEY = (process.env as any).API_KEY;
-  if (!API_KEY) {
-    throw new Error("API_KEY environment variable not set. Please configure your API key.");
-  }
-  ai = new GoogleGenAI({ apiKey: API_KEY });
-  return ai;
-};
+import { getGenAI } from "./geminiClient";
 
 const model = "gemini-2.5-flash";
 
@@ -276,6 +264,8 @@ export const createVideoSequence = async (
     const repairedAndValidatedDecisions: EditDecision[] = parsedJson.editDecisions
       .map((item: any) => {
         if (typeof item !== "object" || item == null) return null;
+        if (clips.length === 0) return null; // <-- THE FIX
+
         const rawIndex = Number(item.clipIndex);
         const duration = Number(item.duration);
         const description = String(item.description || "").trim();
@@ -291,7 +281,7 @@ export const createVideoSequence = async (
       })
       .filter((x): x is EditDecision => x !== null);
 
-    if (repairedAndValidatedDecisions.length === 0) {
+    if (repairedAndValidatedDecisions.length === 0 && clips.length > 0) {
       throw new Error("The AI failed to produce valid edit decisions. Try again with different clips or a simpler prompt.");
     }
 

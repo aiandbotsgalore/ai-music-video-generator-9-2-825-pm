@@ -11,6 +11,23 @@ import type { VideoAnalysis } from '../types';
 
 const WORKER_TIMEOUT_MS = 30000; // 30s timeout per analysis task
 
+// This function is now defined in the module scope, so it can be exported and tested.
+export function calculateMotionFromImageData(frame1: any, frame2: any) {
+  const data1 = frame1.data;
+  const data2 = frame2.data;
+  let diff = 0;
+  for (let i = 0; i < data1.length; i += 4) {
+    const r1 = data1[i], g1 = data1[i + 1], b1 = data1[i + 2];
+    const r2 = data2[i], g2 = data2[i + 1], b2 = data2[i + 2];
+    diff += Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+  }
+  const motionScore = (diff / (data1.length * 0.75 * 255));
+  if (motionScore > 0.1) return 'high';
+  if (motionScore > 0.03) return 'medium';
+  if (motionScore > 0.005) return 'low';
+  return 'static';
+}
+
 // Worker code (runs in dedicated Worker)
 const workerCode = `
 self.importScripts(
@@ -18,6 +35,9 @@ self.importScripts(
   'https://unpkg.com/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js',
   'https://unpkg.com/@tensorflow-models/blazeface@0.1.0/dist/blazeface.min.js'
 );
+
+// The function is injected here as a string.
+${calculateMotionFromImageData.toString()}
 
 let objectModel = null;
 let faceModel = null;
@@ -86,22 +106,6 @@ function classifyObjects(objects) {
     if (classes.has('sports ball') || classes.has('skateboard') || classes.has('surfboard')) return 'action';
     if (classes.has('bird') || classes.has('cat') || classes.has('dog') || classes.has('tree')) return 'nature';
     return 'other';
-}
-
-function calculateMotionFromImageData(frame1, frame2) {
-  const data1 = frame1.data;
-  const data2 = frame2.data;
-  let diff = 0;
-  for (let i = 0; i < data1.length; i += 4) {
-    const r1 = data1[i], g1 = data1[i + 1], b1 = data1[i + 2];
-    const r2 = data2[i], g2 = data2[i + 1], b2 = data2[i + 2];
-    diff += Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
-  }
-  const motionScore = (diff / (data1.length * 3 * 255));
-  if (motionScore > 0.1) return 'high';
-  if (motionScore > 0.03) return 'medium';
-  if (motionScore > 0.005) return 'low';
-  return 'static';
 }
 
 self.onmessage = async (event) => {
