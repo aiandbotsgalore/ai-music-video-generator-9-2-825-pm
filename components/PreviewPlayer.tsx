@@ -103,16 +103,22 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
             setActiveClipDescription(`Clip ${currentSegment.clipIndex + 1}: "${currentSegment.description}"`);
             const clipFileIndex = currentSegment.clipIndex;
 
+            // Safe seek function to prevent errors by clamping the time
+            const safeSeek = (targetTime: number) => {
+                if (!isNaN(video.duration)) {
+                    try {
+                        video.currentTime = Math.max(0, Math.min(targetTime, video.duration - 0.05));
+                    } catch (e) {
+                        // Ignore seek errors, they might happen during rapid source changes
+                    }
+                }
+            };
+
             // If the clip index hasn't changed, just ensure time sync
             if (clipFileIndex === currentClipIndexRef.current) {
                 const timeInClip = time - currentSegment.startTime;
                 if (!isNaN(video.duration) && Math.abs(video.currentTime - timeInClip) > 0.25) {
-                    // Only update if video is ready to seek
-                    try {
-                        video.currentTime = timeInClip;
-                    } catch (e) {
-                        // ignore seek errors; will sync on next loadedmetadata
-                    }
+                    safeSeek(timeInClip);
                 }
                 return;
             }
@@ -136,13 +142,8 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
                             return;
                         }
                         const timeInClip = time - currentSegment.startTime;
-                        try {
-                            if (!isNaN(video.duration)) {
-                                video.currentTime = Math.min(timeInClip, video.duration - 0.05);
-                            }
-                        } catch (e) {
-                            // ignore seek errors
-                        }
+                        safeSeek(timeInClip);
+                        
                         video.removeEventListener('loadedmetadata', onLoadedMeta);
                         // If audio is playing, try to resume video playback
                         if (!audio.paused) {
@@ -155,9 +156,7 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
                     // same src but currentClipIndexRef mismatch — ensure seek
                     const timeInClip = time - currentSegment.startTime;
                     if (Math.abs(video.currentTime - timeInClip) > 0.25) {
-                        try {
-                            video.currentTime = timeInClip;
-                        } catch (e) {}
+                        safeSeek(timeInClip);
                     }
                     currentClipIndexRef.current = clipFileIndex;
                 }
