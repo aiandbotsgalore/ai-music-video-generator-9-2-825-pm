@@ -10,6 +10,14 @@ const getGenAI = (): GoogleGenAI => {
         return ai;
     }
 
+    // --- CRITICAL SECURITY WARNING ---
+    // The Gemini API key is being exposed on the client-side.
+    // This is a major security risk. In a production environment,
+    // this key MUST be secured on a server-side proxy. The client
+    // should make requests to your server, which then securely
+    // communicates with the Gemini API.
+    // Do NOT deploy this application to the public with the key
+    // exposed like this.
     const API_KEY = process.env.API_KEY;
     if (!API_KEY) {
       throw new Error("API_KEY environment variable not set. Please configure your API key.");

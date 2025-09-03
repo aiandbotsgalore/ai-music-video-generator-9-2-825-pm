@@ -9,7 +9,7 @@ import ClipLibraryView from './components/ClipLibraryView';
 import { getClipMetadata } from './utils/video';
 import { createVideoSequence } from './services/geminiService';
 import * as db from './services/dbService';
-import { analyzeVideoContent } from './services/videoAnalysisService';
+import { analyzeVideoContent, terminateWorker } from './services/videoAnalysisService';
 import type { GeneratedVideo, ClipMetadata, AudioAnalysis, VideoAnalysis, CreativeRationale } from './types';
 import { LogoIcon } from './components/icons/LogoIcon';
 
@@ -62,6 +62,11 @@ const App: React.FC = () => {
       }
     };
     loadData();
+    
+    // Clean up the analysis worker when the app unmounts
+    return () => {
+        terminateWorker();
+    }
   }, []);
 
 
@@ -76,7 +81,7 @@ const App: React.FC = () => {
     setIsProcessingClips(true);
     setError(null);
     const existingIds = new Set(clipLibrary.map(c => c.id));
-    const trulyNewFiles = newFiles.filter(f => !existingIds.has(`${f.name}-${f.lastModified}`));
+    const trulyNewFiles = newFiles.filter(f => !existingIds.has(`${f.name}-${f.lastModified}-${f.size}`));
     
     if (trulyNewFiles.length > 0) {
         try {

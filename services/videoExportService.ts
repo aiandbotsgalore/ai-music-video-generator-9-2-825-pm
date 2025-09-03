@@ -1,4 +1,3 @@
-
 import type { GeneratedVideo } from "../types";
 
 // These declarations inform TypeScript that FFmpeg and FFmpegUtil will be available as global variables at runtime.
@@ -52,35 +51,58 @@ export const exportVideo = async (
     });
 
     onProgress(0, 'Preparing media files...');
+
+    // 1. De-duplicate video files using a robust key to handle different files with the same name.
+    const uniqueFiles = new Map<string, File>();
+    videoFiles.forEach(file => {
+        const id = `${file.name}-${file.lastModified}-${file.size}`;
+        if (!uniqueFiles.has(id)) {
+            uniqueFiles.set(id, file);
+        }
+    });
+    const uniqueVideoFilesArray = Array.from(uniqueFiles.values());
+
     // Write audio to ffmpeg's virtual file system
     await ffmpeg.writeFile(audioFile.name, await FFmpegUtil.fetchFile(audioFile));
     
-    // De-duplicate video files to only write and process each unique file once.
-    const uniqueVideoFiles = [...new Map(videoFiles.map(item => [item.name, item])).values()];
-    for (const file of uniqueVideoFiles) {
+    // 2. Write unique video files to FFmpeg's virtual FS with unique names to avoid collisions.
+    const uniqueIdToVirtualNameMap = new Map<string, string>();
+    for (let i = 0; i < uniqueVideoFilesArray.length; i++) {
+        const file = uniqueVideoFilesArray[i];
+        const id = `${file.name}-${file.lastModified}-${file.size}`;
+        const virtualName = `input${i}.mp4`; // e.g., input0.mp4, input1.mp4
+        uniqueIdToVirtualNameMap.set(id, virtualName);
         onProgress(0, `Loading clip: ${file.name}`);
-        await ffmpeg.writeFile(file.name, await FFmpegUtil.fetchFile(file));
+        await ffmpeg.writeFile(virtualName, await FFmpegUtil.fetchFile(file));
     }
+
 
     const inputs: string[] = [];
     const filterComplex: string[] = [];
     let concatInputs = '';
 
-    // Create a mapping from file name to its index in the unique list
-    const fileNameToIndexMap = new Map(uniqueVideoFiles.map((file, index) => [file.name, index]));
-
     // Audio is the first input
     inputs.push('-i', audioFile.name);
 
-    // Add each unique video file as an input
-    uniqueVideoFiles.forEach(file => {
-        inputs.push('-i', file.name);
+    // Add each unique video file as an input using its virtual name
+    uniqueVideoFilesArray.forEach(file => {
+        const id = `${file.name}-${file.lastModified}-${file.size}`;
+        const virtualName = uniqueIdToVirtualNameMap.get(id)!;
+        inputs.push('-i', virtualName);
+    });
+    
+    // Create a map from the robust key to the ffmpeg stream index.
+    const uniqueIdToStreamIndexMap = new Map<string, number>();
+    uniqueVideoFilesArray.forEach((file, index) => {
+        const id = `${file.name}-${file.lastModified}-${file.size}`;
+        uniqueIdToStreamIndexMap.set(id, index + 1); // +1 because audio is stream 0
     });
 
+    // 3. Build the filter_complex command using the correct stream indexes.
     editDecisionList.forEach((decision, index) => {
         const originalFile = videoFiles[decision.clipIndex];
-        // The video stream index is its position in the unique list + 1 (because audio is at index 0)
-        const videoStreamIndex = fileNameToIndexMap.get(originalFile.name)! + 1;
+        const id = `${originalFile.name}-${originalFile.lastModified}-${originalFile.size}`;
+        const videoStreamIndex = uniqueIdToStreamIndexMap.get(id)!;
         
         filterComplex.push(`[${videoStreamIndex}:v]trim=duration=${decision.duration},setpts=PTS-STARTPTS[v${index}]`);
         concatInputs += `[v${index}]`;

@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import type { GeneratedVideo, ClipMetadata, EditDecision } from '../types';
 import { exportVideo } from '../services/videoExportService';
@@ -47,6 +46,7 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
   const audioRef = useRef<HTMLAudioElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const currentClipIndexRef = useRef<number | null>(null);
+  const pendingSwitchRef = useRef<number>(0); // generation id to cancel stale switches
 
   const audioUrl = useMemo(() => URL.createObjectURL(audioFile), [audioFile]);
   const videoUrls = useMemo(() => videoFiles.map(file => URL.createObjectURL(file)), [videoFiles]);
@@ -62,10 +62,10 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
 
   const videoClipMetadata = useMemo(() => {
       const fileToMetaMap = new Map<string, ClipMetadata>();
-      clipLibrary.forEach(clip => fileToMetaMap.set(`${clip.file.name}-${clip.file.lastModified}`, clip));
+      clipLibrary.forEach(clip => fileToMetaMap.set(`${clip.file.name}-${clip.file.lastModified}-${clip.file.size}`, clip));
       
       return generatedVideo.videoFiles.map(file => 
-          fileToMetaMap.get(`${file.name}-${file.lastModified}`)
+          fileToMetaMap.get(`${file.name}-${file.lastModified}-${file.size}`)
       ).filter((c): c is ClipMetadata => c !== undefined);
   }, [generatedVideo, clipLibrary]);
   
@@ -86,7 +86,11 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
            setDuration(audio.duration);
         }
     };
-
+    
+    const onPlay = () => { video.play().catch(e => console.error("Video play failed:", e)); setIsPlaying(true); };
+    const onPause = () => { video.pause(); setIsPlaying(false); };
+    const onEnded = () => { video.pause(); setIsPlaying(false); setIsFinished(true); };
+    
     const syncVideo = (time: number) => {
         const currentSegment = clipSegments.find(
             (segment) => time >= segment.startTime && time < segment.endTime
@@ -99,17 +103,68 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
             setActiveClipDescription(`Clip ${currentSegment.clipIndex + 1}: "${currentSegment.description}"`);
             const clipFileIndex = currentSegment.clipIndex;
 
-            if (clipFileIndex !== currentClipIndexRef.current && clipFileIndex >= 0 && clipFileIndex < videoUrls.length) {
-                video.src = videoUrls[clipFileIndex];
-                currentClipIndexRef.current = clipFileIndex;
-            }
-            
-            if (currentClipIndexRef.current !== null) {
+            // If the clip index hasn't changed, just ensure time sync
+            if (clipFileIndex === currentClipIndexRef.current) {
                 const timeInClip = time - currentSegment.startTime;
-                if (Math.abs(video.currentTime - timeInClip) > 0.25) {
-                    video.currentTime = timeInClip;
+                if (!isNaN(video.duration) && Math.abs(video.currentTime - timeInClip) > 0.25) {
+                    // Only update if video is ready to seek
+                    try {
+                        video.currentTime = timeInClip;
+                    } catch (e) {
+                        // ignore seek errors; will sync on next loadedmetadata
+                    }
+                }
+                return;
+            }
+
+            // If we need to switch the video source:
+            if (clipFileIndex >= 0 && clipFileIndex < videoUrls.length) {
+                const newSrc = videoUrls[clipFileIndex];
+                // Avoid re-assigning the same src
+                if (video.src !== newSrc) {
+                    const switchGeneration = ++pendingSwitchRef.current;
+
+                    // Set the new source, then wait for loadedmetadata to set time
+                    video.pause();
+                    video.src = newSrc;
+                    currentClipIndexRef.current = clipFileIndex;
+
+                    const onLoadedMeta = () => {
+                        // If another switch happened since we initiated this one, abort
+                        if (switchGeneration !== pendingSwitchRef.current) {
+                            video.removeEventListener('loadedmetadata', onLoadedMeta);
+                            return;
+                        }
+                        const timeInClip = time - currentSegment.startTime;
+                        try {
+                            if (!isNaN(video.duration)) {
+                                video.currentTime = Math.min(timeInClip, video.duration - 0.05);
+                            }
+                        } catch (e) {
+                            // ignore seek errors
+                        }
+                        video.removeEventListener('loadedmetadata', onLoadedMeta);
+                        // If audio is playing, try to resume video playback
+                        if (!audio.paused) {
+                            video.play().catch(() => { /* swallow play errors */ });
+                        }
+                    };
+
+                    video.addEventListener('loadedmetadata', onLoadedMeta);
+                } else {
+                    // same src but currentClipIndexRef mismatch — ensure seek
+                    const timeInClip = time - currentSegment.startTime;
+                    if (Math.abs(video.currentTime - timeInClip) > 0.25) {
+                        try {
+                            video.currentTime = timeInClip;
+                        } catch (e) {}
+                    }
+                    currentClipIndexRef.current = clipFileIndex;
                 }
             }
+        } else {
+            // no current segment — we could pause the video
+            currentClipIndexRef.current = null;
         }
     };
     
@@ -119,9 +174,6 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
         syncVideo(now);
     };
 
-    const onPlay = () => { video.play().catch(e => console.error("Video play failed:", e)); setIsPlaying(true); };
-    const onPause = () => { video.pause(); setIsPlaying(false); };
-    const onEnded = () => { video.pause(); setIsPlaying(false); setIsFinished(true); };
     const onSeeking = () => syncVideo(audio.currentTime);
 
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
@@ -141,6 +193,13 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
         audio.removeEventListener("pause", onPause);
         audio.removeEventListener("ended", onEnded);
         audio.removeEventListener("seeking", onSeeking);
+        // remove any pending load listeners on the video
+        try {
+          if (video) {
+              video.removeAttribute('src');
+              video.load();
+          }
+        } catch (e) {}
     };
   }, [clipSegments, videoUrls]);
   
@@ -206,7 +265,7 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
       if (swapState.segmentIndex === null) return;
       
       const newClipFileIndex = generatedVideo.videoFiles.findIndex(f => 
-          f.name === newClip.file.name && f.lastModified === newClip.file.lastModified
+          f.name === newClip.file.name && f.lastModified === newClip.file.lastModified && f.size === newClip.file.size
       );
       
       if (newClipFileIndex === -1) {

@@ -65,7 +65,7 @@ export const getClipMetadata = (file: File): Promise<ClipMetadata> => {
         const thumbnail = await extractFrame(file, 0.1); // Get thumbnail from near the start
         
         const metadata: ClipMetadata = {
-          id: `${file.name}-${file.lastModified}`, // A reasonably unique ID
+          id: `${file.name}-${file.lastModified}-${file.size}`, // A robust unique ID
           file: file,
           name: file.name,
           size: file.size,

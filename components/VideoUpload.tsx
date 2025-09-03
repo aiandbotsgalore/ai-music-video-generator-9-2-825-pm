@@ -58,7 +58,7 @@ const VideoUpload: React.FC<VideoUploadProps> = ({ onSubmit, onBack, onClipsAdde
 
   const atLeastOneClipReady = useMemo(() => {
     return allSelectedFiles.some(file => {
-        const clipMeta = clipLibrary.find(c => c.id === `${file.name}-${file.lastModified}`);
+        const clipMeta = clipLibrary.find(c => c.id === `${file.name}-${file.lastModified}-${file.size}`);
         return clipMeta?.analysisStatus === 'ready';
     });
   }, [allSelectedFiles, clipLibrary]);
@@ -181,7 +181,7 @@ const VideoUpload: React.FC<VideoUploadProps> = ({ onSubmit, onBack, onClipsAdde
                     <h3 className="text-lg font-semibold text-gray-300 mb-2">Selected Clips ({allSelectedFiles.length})</h3>
                     <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 max-h-64 overflow-y-auto p-2 bg-gray-900/50 rounded-lg">
                         {allSelectedFiles.map((file, index) => {
-                            const clipMeta = clipLibraryMap.get(`${file.name}-${file.lastModified}`);
+                            const clipMeta = clipLibraryMap.get(`${file.name}-${file.lastModified}-${file.size}`);
                             const url = useMemo(() => URL.createObjectURL(file), [file]);
                             useEffect(() => () => URL.revokeObjectURL(url), [url]);
 
