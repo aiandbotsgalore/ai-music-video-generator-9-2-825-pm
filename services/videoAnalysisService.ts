@@ -11,7 +11,13 @@ import type { VideoAnalysis } from '../types';
 
 const WORKER_TIMEOUT_MS = 30000; // 30s timeout per analysis task
 
-// This function is now defined in the module scope, so it can be exported and tested.
+/**
+ * Calculates the motion level between two image data frames.
+ * This function is exported for testing purposes.
+ * @param {ImageData} frame1 The first image data.
+ * @param {ImageData} frame2 The second image data.
+ * @returns {'static' | 'low' | 'medium' | 'high'} The calculated motion level.
+ */
 export function calculateMotionFromImageData(frame1: any, frame2: any) {
   const data1 = frame1.data;
   const data2 = frame2.data;
@@ -271,6 +277,9 @@ function createWorkerInstance() {
   }
 }
 
+/**
+ * Terminates the video analysis worker and rejects any pending tasks.
+ */
 export function terminateWorker() {
   if (worker) {
     try {
@@ -287,7 +296,12 @@ export function terminateWorker() {
   runningTasks.clear();
 }
 
-// Helper: extract frames on main thread and create transferable ImageBitmap(s)
+/**
+ * Extracts frames from a video file at specified times and returns them as ImageBitmaps.
+ * @param {File} file The video file to extract frames from.
+ * @param {number[]} frameTimes An array of timestamps (in seconds) to extract frames at.
+ * @returns {Promise<ImageBitmap[]>} A promise that resolves to an array of ImageBitmap objects.
+ */
 async function extractFramesAsImageBitmaps(file: File, frameTimes: number[]): Promise<ImageBitmap[]> {
   return new Promise(async (resolve, reject) => {
     const video = document.createElement('video');
@@ -349,6 +363,12 @@ async function extractFramesAsImageBitmaps(file: File, frameTimes: number[]): Pr
   });
 }
 
+/**
+ * Analyzes the content of a video file by extracting frames and sending them to a web worker for processing.
+ * This function is optimized to extract fewer frames for short videos.
+ * @param {File} file The video file to analyze.
+ * @returns {Promise<VideoAnalysis>} A promise that resolves to the video analysis results.
+ */
 export async function analyzeVideoContent(file: File): Promise<VideoAnalysis> {
   const fileId = `${file.name}-${file.lastModified}-${file.size}`;
 
@@ -402,11 +422,20 @@ export async function analyzeVideoContent(file: File): Promise<VideoAnalysis> {
       const duration = videoForMeta.duration;
       URL.revokeObjectURL(videoForMeta.src);
 
-      // Choose frame times
-      let frameTimes = [0.2 * duration, 0.5 * duration, 0.8 * duration].filter(t => t > 0.05 && t < duration - 0.05);
+      // Choose frame times based on video duration
+      let frameTimes;
+      if (duration < 10) {
+        // For short videos, take two frames to allow for motion analysis
+        frameTimes = [duration * 0.25, duration * 0.75];
+      } else {
+        // For longer videos, take three frames
+        frameTimes = [0.2 * duration, 0.5 * duration, 0.8 * duration];
+      }
+      frameTimes = frameTimes.filter(t => t > 0.05 && t < duration - 0.05);
       if (frameTimes.length === 0) {
         frameTimes = [Math.min(0.2, duration / 2)];
       }
+
 
       const bitmaps = await extractFramesAsImageBitmaps(file, frameTimes);
 
