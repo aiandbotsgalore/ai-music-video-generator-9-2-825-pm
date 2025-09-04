@@ -1,3 +1,4 @@
+
 import React, { useState, useMemo } from 'react';
 import type { ClipMetadata } from '../types';
 import { UploadIcon } from './icons/UploadIcon';
@@ -7,6 +8,8 @@ interface ClipLibraryViewProps {
     clips: ClipMetadata[];
     onAddClips: (files: File[]) => void;
     isProcessing: boolean;
+    onCancelAnalysis: (clipId: string) => void;
+    onRetryAnalysis: (clipId: string) => void;
 }
 
 const formatBytes = (bytes: number, decimals = 2) => {
@@ -44,13 +47,28 @@ const sortOptions = [
 ];
 
 
-const ClipCard: React.FC<{clip: ClipMetadata}> = ({ clip }) => (
+const ClipCard: React.FC<{clip: ClipMetadata; onCancel: (id: string) => void; onRetry: (id: string) => void;}> = ({ clip, onCancel, onRetry }) => (
     <div className="bg-gray-800 rounded-lg overflow-hidden group">
         <div className="relative aspect-video bg-gray-900">
             <img src={`data:image/jpeg;base64,${clip.thumbnail}`} alt={clip.name} className="w-full h-full object-cover"/>
-            {clip.analysisStatus !== 'ready' && (
+            <div 
+                className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center p-2 text-center transition-opacity opacity-0 group-hover:opacity-100"
+                title={clip.analysisStatus === 'error' ? clip.analysisError : ""}
+            >
+                {(clip.analysisStatus === 'analyzing' || clip.analysisStatus === 'pending') && (
+                    <button onClick={() => onCancel(clip.id)} className="px-3 py-1.5 bg-red-600/80 text-white rounded-md text-sm font-semibold hover:bg-red-500">
+                        Cancel
+                    </button>
+                )}
+                 {clip.analysisStatus === 'error' && (
+                    <button onClick={() => onRetry(clip.id)} className="px-3 py-1.5 bg-blue-600/80 text-white rounded-md text-sm font-semibold hover:bg-blue-500">
+                        Retry
+                    </button>
+                )}
+            </div>
+             {clip.analysisStatus !== 'ready' && (
                 <div 
-                    className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center p-2 text-center"
+                    className="absolute inset-0 bg-black/60 flex flex-col items-center justify-center p-2 text-center pointer-events-none group-hover:opacity-0"
                     title={clip.analysisStatus === 'error' ? clip.analysisError : "Analysis in progress..."}
                 >
                     {clip.analysisStatus === 'analyzing' && (
@@ -102,7 +120,7 @@ const ClipCard: React.FC<{clip: ClipMetadata}> = ({ clip }) => (
     </div>
 )
 
-const ClipLibraryView: React.FC<ClipLibraryViewProps> = ({ clips, onAddClips, isProcessing }) => {
+const ClipLibraryView: React.FC<ClipLibraryViewProps> = ({ clips, onAddClips, isProcessing, onCancelAnalysis, onRetryAnalysis }) => {
     const [isDragging, setIsDragging] = useState(false);
     const [sortBy, setSortBy] = useState(sortOptions[0].value);
 
@@ -221,7 +239,7 @@ const ClipLibraryView: React.FC<ClipLibraryViewProps> = ({ clips, onAddClips, is
             )}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 max-h-[60vh] overflow-y-auto p-1">
-                {sortedClips.map(clip => <ClipCard key={clip.id} clip={clip} />)}
+                {sortedClips.map(clip => <ClipCard key={clip.id} clip={clip} onCancel={onCancelAnalysis} onRetry={onRetryAnalysis} />)}
             </div>
         </div>
     );

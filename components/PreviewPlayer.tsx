@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import type { GeneratedVideo, ClipMetadata, EditDecision } from '../types';
 import { exportVideo } from '../services/videoExportService';
@@ -138,20 +139,18 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
                     const onLoadedMeta = () => {
                         // If another switch happened since we initiated this one, abort
                         if (switchGeneration !== pendingSwitchRef.current) {
-                            video.removeEventListener('loadedmetadata', onLoadedMeta);
                             return;
                         }
                         const timeInClip = time - currentSegment.startTime;
                         safeSeek(timeInClip);
                         
-                        video.removeEventListener('loadedmetadata', onLoadedMeta);
                         // If audio is playing, try to resume video playback
                         if (!audio.paused) {
                             video.play().catch(() => { /* swallow play errors */ });
                         }
                     };
 
-                    video.addEventListener('loadedmetadata', onLoadedMeta);
+                    video.addEventListener('loadedmetadata', onLoadedMeta, { once: true });
                 } else {
                     // same src but currentClipIndexRef mismatch — ensure seek
                     const timeInClip = time - currentSegment.startTime;
@@ -224,12 +223,11 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
     }
   };
 
-  const handleDownload = async () => {
+  const handleDownload = async (quality: 'full' | 'preview') => {
       setIsRendering(true);
       setRenderProgress(0);
-      setRenderMessage("Starting video export...");
+      setRenderMessage(quality === 'preview' ? "Starting preview export..." : "Starting full quality export...");
       try {
-          // Create a new video object with the modified edit list for export
           const finalVideo: GeneratedVideo = {
               ...generatedVideo,
               editDecisionList: localEditList,
@@ -237,14 +235,19 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
           await exportVideo(finalVideo, (progress, message) => {
               setRenderProgress(progress);
               setRenderMessage(message);
-          });
+          }, quality);
       } catch (err) {
           console.error("Failed to export video:", err);
-          setRenderMessage(`Export Failed: ${err instanceof Error ? err.message : 'Unknown error'}. Please try again.`);
+          const friendlyMessage = err instanceof Error && err.message.toLowerCase().includes("memory")
+            ? "Export failed due to high memory usage. Please try the 'Download Preview' option."
+            : `Export Failed: ${err instanceof Error ? err.message : 'Unknown error'}. Please try again.`;
+          setRenderMessage(friendlyMessage);
           setTimeout(() => setIsRendering(false), 5000);
           return;
       }
-      setIsRendering(false);
+      // Keep render message on screen briefly after completion
+      setRenderMessage("Export complete! Download starting...");
+      setTimeout(() => setIsRendering(false), 3000);
   }
 
   const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -278,7 +281,6 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
           newList[swapState.segmentIndex!] = {
               ...segmentToUpdate,
               clipIndex: newClipFileIndex,
-              description: `User Override: ${newClip.name}`
           };
           return newList;
       });
@@ -361,19 +363,17 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
             </div>
         </div>
 
-        {creativeRationale && (
-            <div className="mt-6 w-full">
-                <button
-                    onClick={() => setShowCommentary(!showCommentary)}
-                    className="w-full flex items-center justify-center gap-2 bg-gray-700/50 hover:bg-gray-700 text-gray-200 font-semibold py-2 px-4 rounded-lg transition-colors"
-                >
-                    <CommentaryIcon className="w-5 h-5" />
-                    {showCommentary ? "Hide" : "Show"} Director's Commentary
-                </button>
-            </div>
-        )}
+        <div className="mt-6 w-full">
+            <button
+                onClick={() => setShowCommentary(!showCommentary)}
+                className="w-full flex items-center justify-center gap-2 bg-gray-700/50 hover:bg-gray-700 text-gray-200 font-semibold py-2 px-4 rounded-lg transition-colors"
+            >
+                <CommentaryIcon className="w-5 h-5" />
+                {showCommentary ? "Hide" : "Show"} Director's Commentary
+            </button>
+        </div>
 
-        {showCommentary && creativeRationale && (
+        {showCommentary && (
             <DirectorsCommentary
                 rationale={creativeRationale}
                 clipMetadata={videoClipMetadata}
@@ -382,19 +382,28 @@ const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ generatedVideo, onRestart
             />
         )}
         
-        <div className="mt-8 flex flex-col sm:flex-row gap-4 w-full max-w-md">
+        <div className="mt-8 w-full max-w-lg space-y-4">
+            <div className="flex flex-col sm:flex-row gap-4">
+                 <button
+                    onClick={() => handleDownload('preview')}
+                    disabled={isRendering}
+                    className="w-full sm:w-1/2 bg-brand-cyan/20 hover:bg-brand-cyan/30 text-brand-cyan font-bold py-3 px-4 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    {isRendering ? 'Rendering...' : 'Download Preview (Faster)'}
+                </button>
+                 <button
+                    onClick={() => handleDownload('full')}
+                    disabled={isRendering}
+                    className="w-full sm:w-1/2 bg-brand-cyan text-gray-900 font-bold py-3 px-4 rounded-lg transition-all disabled:bg-brand-cyan/50 disabled:cursor-not-allowed"
+                >
+                    {isRendering ? 'Rendering...' : 'Download Full Quality'}
+                </button>
+            </div>
             <button
                 onClick={onRestart}
                 className="w-full bg-gray-600 hover:bg-gray-500 text-white font-bold py-3 px-4 rounded-lg transition-all"
             >
                 Create New Video
-            </button>
-             <button
-                onClick={handleDownload}
-                disabled={isRendering}
-                className="w-full bg-brand-cyan text-gray-900 font-bold py-3 px-4 rounded-lg transition-all disabled:bg-brand-cyan/50 disabled:cursor-not-allowed"
-            >
-                {isRendering ? 'Rendering...' : 'Download Video'}
             </button>
         </div>
     </div>

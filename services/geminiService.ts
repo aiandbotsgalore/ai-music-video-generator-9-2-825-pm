@@ -1,26 +1,15 @@
-import { GoogleGenAI, Type } from "@google/genai";
+
 import type { EditDecision, AudioAnalysis, ClipMetadata, CreativeRationale } from "../types";
-
-let ai: GoogleGenAI | null = null;
-
-const getGenAI = (): GoogleGenAI => {
-  if (ai) return ai;
-  // Lazy init; caller is expected to configure environment/build to make this work.
-  const API_KEY = (process.env as any).API_KEY;
-  if (!API_KEY) {
-    throw new Error("API_KEY environment variable not set. Please configure your API key.");
-  }
-  ai = new GoogleGenAI({ apiKey: API_KEY });
-  return ai;
-};
+import { resizeBlobToMaxBytes, blobToBase64 } from './imageUtils';
+import { getGenAI } from './geminiClient';
 
 const model = "gemini-2.5-flash";
 
 /* Config / limits */
-const TIMEOUT_MS = 60_000; // 60s timeout for the AI call
-const MAX_TOTAL_THUMBNAILS_BYTES = 1_000_000; // 1 MB for all thumbnails combined
-const MAX_TOTAL_PAYLOAD_BYTES = 2_000_000; // 2 MB total payload safeguard
-const MAX_OUTPUT_TOKENS = 8192; // reasonable upper bound for responses
+const TIMEOUT_MS = 90_000; // Increased timeout for streaming
+const MAX_TOTAL_THUMBNAILS_BYTES = 1_000_000; // 1 MB
+const PER_THUMBNAIL_TARGET_BYTES = 50 * 1024; // 50 KB
+const MAX_OUTPUT_TOKENS = 8192;
 
 /* --- Helpers --- */
 const fileToBase64 = (file: File): Promise<string> =>
@@ -38,14 +27,11 @@ const fileToBase64 = (file: File): Promise<string> =>
     reader.onerror = (e) => reject(e);
   });
 
-const ensureBase64Data = (maybeDataUrlOrBase64: string | undefined | null): string => {
-  if (!maybeDataUrlOrBase64) return "";
-  const s = maybeDataUrlOrBase64.trim();
-  const comma = s.indexOf(",");
-  return comma >= 0 ? s.slice(comma + 1) : s;
+const base64ToBlob = async (base64: string, mimeType: string = 'image/jpeg'): Promise<Blob> => {
+    const res = await fetch(`data:${mimeType};base64,${base64}`);
+    return await res.blob();
 };
 
-// Estimate bytes from base64 string (approx)
 const base64Bytes = (b64: string) => Math.ceil((b64.length * 3) / 4);
 
 /* Lightweight runtime validation for the parsed JSON response */
@@ -63,7 +49,6 @@ function validateParsedResponse(obj: any): { ok: boolean; reason?: string } {
     if (typeof d.description !== "string") return { ok: false, reason: `editDecisions[${i}].description is not a string.` };
   }
 
-  // Timeline structure validation (if present)
   const timeline = obj.creativeRationale.timeline;
   if (!Array.isArray(timeline)) return { ok: false, reason: "'creativeRationale.timeline' missing or not an array." };
   for (let i = 0; i < timeline.length; i++) {
@@ -91,70 +76,12 @@ function normalizeDurations(decisions: EditDecision[], targetTotal: number): Edi
   const total = decisions.reduce((s, d) => s + Math.max(0.001, d.duration), 0);
   if (total <= 0.001 || targetTotal <= 0) return decisions;
   const scale = targetTotal / total;
-  // Keep minimum duration and round to 2 decimal places
   return decisions.map(d => {
     const newDur = Math.max(0.1, Math.round(d.duration * scale * 100) / 100);
     return { ...d, duration: newDur };
   });
 }
 
-/* Timeout wrapper */
-function withTimeout<T>(p: Promise<T>, ms: number, msg = "Timed out") {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(msg)), ms);
-    p.then(v => {
-      clearTimeout(t);
-      resolve(v);
-    }).catch(err => {
-      clearTimeout(t);
-      reject(err);
-    });
-  });
-}
-
-/* Response JSON schema for the model (kept as guidance in the request) */
-const responseSchema = {
-  type: Type.OBJECT,
-  properties: {
-    editDecisions: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          clipIndex: { type: Type.INTEGER },
-          duration: { type: Type.NUMBER },
-          description: { type: Type.STRING },
-        },
-        required: ["clipIndex", "duration", "description"],
-      },
-    },
-    creativeRationale: {
-      type: Type.OBJECT,
-      properties: {
-        overallTheme: { type: Type.STRING },
-        pacingStrategy: { type: Type.STRING },
-        colorPalette: { type: Type.STRING },
-        timeline: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              startTime: { type: Type.NUMBER },
-              endTime: { type: Type.NUMBER },
-              clipIndex: { type: Type.INTEGER },
-              rationale: { type: Type.STRING },
-            },
-            required: ["startTime", "endTime", "clipIndex", "rationale"],
-          },
-        },
-      },
-      required: ["overallTheme", "pacingStrategy", "colorPalette", "timeline"],
-    },
-  },
-  required: ["editDecisions", "creativeRationale"],
-};
-
-/* Build prompt (unchanged in spirit; kept concise here) */
 const generateContentAwarePrompt = (
   musicDescription: string,
   audioAnalysis: AudioAnalysis,
@@ -174,10 +101,17 @@ const generateContentAwarePrompt = (
     return `Clip ${index} (${clip.name}): A ${brightnessDesc}, ${complexityDesc} clip. ${motionDesc}, primarily featuring ${dominantCategory}. ${faceDesc}`;
   }).join("\n");
 
-  const directorialMandate = `You are an experienced music video director. Produce a single JSON object (see schema) with 'editDecisions' and 'creativeRationale'. Make intentional connections between the music's energy and the chosen visuals. Synchronize cuts with beats and phrase changes.`;
+  const directorialMandate = `You are an experienced music video director.`;
 
   return `
 ${directorialMandate}
+
+First, you MUST provide a few short status updates on new lines, each ending with an ellipsis. For example:
+Analyzing music...
+Reviewing visual content...
+Generating edit decisions...
+
+Then, after the updates, you MUST provide the final JSON object in a single markdown code block.
 
 AUDIO SUMMARY:
 - Vibe: "${musicDescription}"
@@ -190,43 +124,51 @@ Available clips (${clips.length}):
 ${formattedVisualSummary}
 
 OUTPUT REQUIREMENTS:
-- Return ONE strict JSON object that matches the schema.
+- Your entire response MUST end with a single JSON object inside a \`\`\`json markdown block.
+- The JSON object must contain 'editDecisions' and 'creativeRationale'.
 - 'editDecisions' durations should sum roughly to the audio duration (${audioAnalysis.duration.toFixed(1)}s).
 - For each decision provide clipIndex, duration (seconds), and a short 5-10 word description.
 - Provide a 'creativeRationale' with overallTheme, pacingStrategy, colorPalette and a timeline array that explains each segment.
-
-Return only the JSON object in the response body (no extraneous commentary).
 `;
 };
 
-/* Primary exported function */
 export const createVideoSequence = async (
   musicDescription: string,
   audioAnalysis: AudioAnalysis,
   clips: ClipMetadata[],
+  onProgress: (update: string) => void,
 ): Promise<{ editDecisionList: EditDecision[]; creativeRationale: CreativeRationale }> => {
+  if (!clips || clips.length === 0) {
+    throw new Error("Cannot generate a video sequence with no video clips provided.");
+  }
+  
   const genAI = getGenAI();
   const prompt = generateContentAwarePrompt(musicDescription, audioAnalysis, clips);
 
-  // Build image parts and enforce max payload size
-  const imageParts: { inlineData: { mimeType: string; data: string } }[] = [];
-  let thumbnailBytesTotal = 0;
+  let totalThumbnailBytes = 0;
+  const imagePartsPromises = clips.map(async (clip) => {
+      const thumbBlob = await base64ToBlob(clip.thumbnail);
+      const targetBytes = (totalThumbnailBytes + thumbBlob.size > MAX_TOTAL_THUMBNAILS_BYTES)
+          ? PER_THUMBNAIL_TARGET_BYTES
+          : thumbBlob.size;
+      
+      const resizedBlob = await resizeBlobToMaxBytes(thumbBlob, targetBytes);
+      const resizedBase64 = await blobToBase64(resizedBlob);
+      totalThumbnailBytes += base64Bytes(resizedBase64);
+      return { inlineData: { mimeType: "image/jpeg", data: resizedBase64 } };
+  });
 
-  for (const clip of clips) {
-    const b64 = ensureBase64Data(clip.thumbnail);
-    const bytes = base64Bytes(b64);
-    thumbnailBytesTotal += bytes;
-    imageParts.push({ inlineData: { mimeType: "image/jpeg", data: b64 } });
+  const imageParts = await Promise.all(imagePartsPromises);
+  
+  if (totalThumbnailBytes > MAX_TOTAL_THUMBNAILS_BYTES) {
+    console.warn(`Total thumbnail size (${totalThumbnailBytes} bytes) still exceeds limit of ${MAX_TOTAL_THUMBNAILS_BYTES}.`);
   }
 
-  const estimatedPayloadBytes = thumbnailBytesTotal; // we only estimate thumbnails here; audio handled elsewhere
-  if (thumbnailBytesTotal > MAX_TOTAL_THUMBNAILS_BYTES || estimatedPayloadBytes > MAX_TOTAL_PAYLOAD_BYTES) {
-    throw new Error("Thumbnails are too large to send to the model directly. Reduce thumbnail size or upload them and provide URLs instead.");
-  }
+  let fullResponseText = '';
+  const startTime = Date.now();
 
   try {
-    // Prepare request. Use a timeout wrapper to avoid a stuck UI.
-    const call = genAI.models.generateContent({
+    const responseStream = await genAI.models.generateContentStream({
       model,
       contents: {
         parts: [
@@ -235,44 +177,46 @@ export const createVideoSequence = async (
         ]
       },
       config: {
-        responseMimeType: "application/json",
-        responseSchema,
         maxOutputTokens: MAX_OUTPUT_TOKENS,
-        thinkingConfig: { thinkingBudget: 512 },
+        temperature: 0.7,
       }
     });
 
-    const response = await withTimeout(call as Promise<any>, TIMEOUT_MS, "AI generation timed out");
-
-    // SDKs sometimes provide structured output. Prefer that if available.
-    const rawText =
-      response?.output?.[0]?.content?.[0]?.text ??
-      response?.text ??
-      (typeof response === "string" ? response : "");
-
-    const text = String(rawText).trim();
-    if (!text) {
+    for await (const chunk of responseStream) {
+        if (Date.now() - startTime > TIMEOUT_MS) {
+            throw new Error("AI generation timed out.");
+        }
+        const chunkText = chunk.text;
+        if(chunkText) {
+          fullResponseText += chunkText;
+          onProgress(chunkText);
+        }
+    }
+    
+    if (!fullResponseText) {
       throw new Error("AI returned an empty response. Try again with different inputs or fewer thumbnails.");
     }
-
-    // Parse JSON
-    let parsedJson: any;
-    try {
-      parsedJson = JSON.parse(text);
-    } catch (e) {
-      // If parsing fails, surface the error with a helpful message
-      console.error("Failed to parse model response as JSON:", text);
-      throw new Error("The AI returned a response in an unexpected format. Try again; if this repeats, simplify inputs.");
+    
+    const jsonMatch = fullResponseText.match(/```json\n([\s\S]*?)\n```/);
+    if (!jsonMatch || !jsonMatch[1]) {
+        console.error("Could not find JSON block in response:", fullResponseText);
+        throw new Error("The AI returned a response in an unexpected format. Please try again.");
     }
 
-    // Runtime validate
+    let parsedJson: any;
+    try {
+      parsedJson = JSON.parse(jsonMatch[1]);
+    } catch (e) {
+      console.error("Failed to parse model response as JSON:", jsonMatch[1]);
+      throw new Error("The AI returned invalid JSON. Try again; if this repeats, simplify inputs.");
+    }
+
     const validation = validateParsedResponse(parsedJson);
     if (!validation.ok) {
       console.error("Model response validation error:", validation.reason, parsedJson);
       throw new Error(`AI response validation failed: ${validation.reason}`);
     }
 
-    // Repair and normalize editDecisions
     const repairedAndValidatedDecisions: EditDecision[] = parsedJson.editDecisions
       .map((item: any) => {
         if (typeof item !== "object" || item == null) return null;
@@ -283,11 +227,7 @@ export const createVideoSequence = async (
           return null;
         }
         const repairedIndex = clampIndex(rawIndex, clips.length);
-        return {
-          clipIndex: repairedIndex,
-          duration,
-          description,
-        } as EditDecision;
+        return { clipIndex: repairedIndex, duration, description } as EditDecision;
       })
       .filter((x): x is EditDecision => x !== null);
 
@@ -295,7 +235,6 @@ export const createVideoSequence = async (
       throw new Error("The AI failed to produce valid edit decisions. Try again with different clips or a simpler prompt.");
     }
 
-    // Normalize durations to match audio duration
     const normalized = normalizeDurations(repairedAndValidatedDecisions, audioAnalysis.duration);
 
     return {
@@ -304,30 +243,16 @@ export const createVideoSequence = async (
     };
   } catch (error) {
     console.error("Error in createVideoSequence:", error instanceof Error ? error.message : error);
-    if (error instanceof Error && error.message.includes("SAFETY")) {
+    if (error instanceof Error && error.message.toLowerCase().includes("safety")) {
       throw new Error("The request was blocked by safety policies. Try different clips or a different description.");
-    }
-    if (error instanceof Error && error.message.includes("timed out")) {
-      throw new Error("AI generation timed out. Try again or reduce payload size (smaller thumbnails).");
     }
     throw error instanceof Error ? error : new Error("AI generation failed unexpectedly.");
   }
 };
 
-/* Also export describeMusic (keeps existing behavior but enforces size limit on audio) */
 export const describeMusic = async (audioFile: File): Promise<string> => {
-  if (audioFile.size > 1_500_000) {
-    // Conservative guidance: don't send large audio blobs directly.
-    throw new Error("Audio file is too large to send directly. Upload a shorter sample or use a server-side proxy to handle the upload.");
-  }
-
   const genAI = getGenAI();
   const base64Audio = await fileToBase64(audioFile);
-
-  const audioBytes = base64Bytes(base64Audio);
-  if (audioBytes > MAX_TOTAL_PAYLOAD_BYTES) {
-    throw new Error("Audio payload is too large to send directly to the model. Please trim or upload audios via a server.");
-  }
 
   const audioPart = {
     inlineData: {
@@ -345,13 +270,19 @@ export const describeMusic = async (audioFile: File): Promise<string> => {
       config: { maxOutputTokens: 256 },
     });
 
-    const response = await withTimeout(call as Promise<any>, TIMEOUT_MS, "AI description timed out");
-    const text = response?.output?.[0]?.content?.[0]?.text ?? response?.text ?? "";
-    const trimmed = String(text).trim();
-    if (!trimmed) throw new Error("AI returned an empty description.");
-    return trimmed;
+    const response = await call;
+    // Fix: The 'text' property on GenerateContentResponse is a non-nullable string.
+    const text = response.text.trim();
+    if (!text) {
+      console.error("AI response for audio description was empty or missing. Full response object:", JSON.stringify(response, null, 2));
+      throw new Error("AI returned an empty description. This could be due to safety filters.");
+    }
+    return text;
   } catch (err) {
     console.error("Error calling AI for audio description:", err instanceof Error ? err.message : err);
+    if (err instanceof Error && err.message.toLowerCase().includes("safety")) {
+      throw new Error("The request was blocked by safety policies. Try a different audio file.");
+    }
     throw err instanceof Error ? err : new Error("Failed to get an AI description for the audio.");
   }
 };

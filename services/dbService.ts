@@ -1,3 +1,4 @@
+
 import type { GeneratedVideo, ClipMetadata } from '../types';
 
 const DB_NAME = 'AIMusicVideoDB';
@@ -56,6 +57,12 @@ const openDB = (): Promise<IDBDatabase> => {
     });
 };
 
+// NOTE: Storing full File objects in IndexedDB can lead to performance issues
+// and exceeding storage quotas. For a production app, this should be refactored
+// to store metadata and use the File System Access API or server-side storage
+// to persist the actual file data. This is retained for now to ensure
+// the "view history" feature remains functional without a major refactor.
+
 export const addHistory = async (video: GeneratedVideo): Promise<void> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
@@ -100,6 +107,28 @@ export const addClip = async (clip: ClipMetadata): Promise<void> => {
         request.onerror = () => reject(request.error);
     });
 };
+
+export const getClip = async (id: string): Promise<ClipMetadata | undefined> => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+        const transaction = db.transaction(CLIPS_STORE, 'readonly');
+        const store = transaction.objectStore(CLIPS_STORE);
+        const request = store.get(id);
+        
+        request.onsuccess = () => {
+            if (request.result) {
+                const item = request.result;
+                 resolve({
+                    ...item,
+                    createdAt: new Date(item.createdAt || item.file.lastModified),
+                });
+            } else {
+                resolve(undefined);
+            }
+        }
+        request.onerror = () => reject(request.error);
+    });
+}
 
 export const getAllClips = async (): Promise<ClipMetadata[]> => {
     const db = await openDB();

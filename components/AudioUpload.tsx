@@ -4,7 +4,7 @@ import { UploadIcon } from './icons/UploadIcon';
 import { MusicNoteIcon } from './icons/MusicNoteIcon';
 import { SparklesIcon } from './icons/SparklesIcon';
 import { describeMusic } from '../services/geminiService';
-import { analyzeAudio } from '../services/audioAnalysisService';
+import { analyzeAudio } from '../services/audioAnalysisWorkerService';
 import type { AudioAnalysis } from '../types';
 
 interface AudioUploadProps {

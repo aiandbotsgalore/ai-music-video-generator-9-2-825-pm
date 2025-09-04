@@ -11,23 +11,6 @@ import type { VideoAnalysis } from '../types';
 
 const WORKER_TIMEOUT_MS = 30000; // 30s timeout per analysis task
 
-// This function is now defined in the module scope, so it can be exported and tested.
-export function calculateMotionFromImageData(frame1: any, frame2: any) {
-  const data1 = frame1.data;
-  const data2 = frame2.data;
-  let diff = 0;
-  for (let i = 0; i < data1.length; i += 4) {
-    const r1 = data1[i], g1 = data1[i + 1], b1 = data1[i + 2];
-    const r2 = data2[i], g2 = data2[i + 1], b2 = data2[i + 2];
-    diff += Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
-  }
-  const motionScore = (diff / (data1.length * 0.75 * 255));
-  if (motionScore > 0.1) return 'high';
-  if (motionScore > 0.03) return 'medium';
-  if (motionScore > 0.005) return 'low';
-  return 'static';
-}
-
 // Worker code (runs in dedicated Worker)
 const workerCode = `
 self.importScripts(
@@ -35,9 +18,6 @@ self.importScripts(
   'https://unpkg.com/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js',
   'https://unpkg.com/@tensorflow-models/blazeface@0.1.0/dist/blazeface.min.js'
 );
-
-// The function is injected here as a string.
-${calculateMotionFromImageData.toString()}
 
 let objectModel = null;
 let faceModel = null;
@@ -108,18 +88,37 @@ function classifyObjects(objects) {
     return 'other';
 }
 
+function calculateMotionFromImageData(frame1, frame2) {
+  const data1 = frame1.data;
+  const data2 = frame2.data;
+  let diff = 0;
+  for (let i = 0; i < data1.length; i += 4) {
+    const r1 = data1[i], g1 = data1[i + 1], b1 = data1[i + 2];
+    const r2 = data2[i], g2 = data2[i + 1], b2 = data2[i + 2];
+    diff += Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+  }
+  const numPixels = data1.length / 4;
+  const maxDiff = numPixels * 3 * 255;
+  const motionScore = diff / maxDiff;
+
+  if (motionScore > 0.1) return 'high';
+  if (motionScore > 0.03) return 'medium';
+  if (motionScore > 0.005) return 'low';
+  return 'static';
+}
+
 self.onmessage = async (event) => {
-  const { imageBitmaps, fileId } = event.data;
+  const { bitmaps, fileId } = event.data;
   try {
     await loadModels();
 
-    if (!imageBitmaps || imageBitmaps.length === 0) {
+    if (!bitmaps || bitmaps.length === 0) {
       throw new Error('No frames provided to worker.');
     }
 
     // Use OffscreenCanvas to get ImageData and to feed tf.fromPixels when needed
-    const centralIndex = Math.floor(imageBitmaps.length / 2);
-    const centralBitmap = imageBitmaps[centralIndex];
+    const centralIndex = Math.floor(bitmaps.length / 2);
+    const centralBitmap = bitmaps[centralIndex];
     const width = centralBitmap.width;
     const height = centralBitmap.height;
 
@@ -139,7 +138,7 @@ self.onmessage = async (event) => {
     const detectedObjects = objectPredictions.map(p => ({ class: p.class, score: p.score }));
 
     // Calculate metrics across frames
-    const brightnessSum = imageBitmaps.reduce((sum, bmp) => {
+    const brightnessSum = bitmaps.reduce((sum, bmp) => {
       const c = new OffscreenCanvas(bmp.width, bmp.height);
       const ct = c.getContext('2d');
       ct.drawImage(bmp, 0, 0, bmp.width, bmp.height);
@@ -147,14 +146,14 @@ self.onmessage = async (event) => {
       return sum + analyzeBrightnessFromImageData(id);
     }, 0);
 
-    const avgBrightness = brightnessSum / imageBitmaps.length;
+    const avgBrightness = brightnessSum / bitmaps.length;
     const visualComplexity = analyzeSobel(centralImageData);
 
     // Motion: compare first and last frames if available
     let motionLevel = 'static';
-    if (imageBitmaps.length > 1) {
-      const first = imageBitmaps[0];
-      const last = imageBitmaps[imageBitmaps.length - 1];
+    if (bitmaps.length > 1) {
+      const first = bitmaps[0];
+      const last = bitmaps[bitmaps.length - 1];
 
       // get imageData for first & last
       const c1 = new OffscreenCanvas(first.width, first.height);
@@ -172,7 +171,7 @@ self.onmessage = async (event) => {
 
     // cleanup transferable ImageBitmaps
     try {
-      imageBitmaps.forEach(b => {
+      bitmaps.forEach(b => {
         if (b && typeof b.close === 'function') {
           b.close();
         }
@@ -390,8 +389,8 @@ export async function analyzeVideoContent(file: File): Promise<VideoAnalysis> {
   runningTasks.set(fileId, task);
 
   (async () => {
+    let bitmaps: ImageBitmap[] = [];
     try {
-      // Load video metadata on main thread to compute frame times
       const videoForMeta = document.createElement('video');
       videoForMeta.preload = 'metadata';
       videoForMeta.src = URL.createObjectURL(file);
@@ -402,18 +401,23 @@ export async function analyzeVideoContent(file: File): Promise<VideoAnalysis> {
       const duration = videoForMeta.duration;
       URL.revokeObjectURL(videoForMeta.src);
 
-      // Choose frame times
       let frameTimes = [0.2 * duration, 0.5 * duration, 0.8 * duration].filter(t => t > 0.05 && t < duration - 0.05);
       if (frameTimes.length === 0) {
         frameTimes = [Math.min(0.2, duration / 2)];
       }
 
-      const bitmaps = await extractFramesAsImageBitmaps(file, frameTimes);
+      bitmaps = await extractFramesAsImageBitmaps(file, frameTimes);
+      
+      try {
+        // Send ImageBitmaps to worker (transferable)
+        workerInstance.postMessage({ bitmaps, fileId }, bitmaps);
+      } catch(e) {
+        // If postMessage fails (e.g., transfer error), close bitmaps on main thread.
+        bitmaps.forEach(b => b.close && b.close());
+        throw e; // re-throw the error to be caught by the outer catch block
+      }
 
-      // Send ImageBitmaps to worker (transferable)
-      workerInstance.postMessage({ imageBitmaps: bitmaps, fileId }, bitmaps);
-
-      // the worker will resolve via onmessage
+      // The worker will resolve the promise via the onmessage handler.
     } catch (err) {
       if (task.timeoutId) clearTimeout(task.timeoutId);
       runningTasks.delete(fileId);

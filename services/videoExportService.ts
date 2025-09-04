@@ -1,3 +1,4 @@
+
 import type { GeneratedVideo } from "../types";
 
 // These declarations inform TypeScript that FFmpeg and FFmpegUtil will be available as global variables at runtime.
@@ -31,7 +32,8 @@ const loadFfmpeg = async (onProgress: (message: string) => void): Promise<void> 
 
 export const exportVideo = async (
     generatedVideo: GeneratedVideo,
-    onProgress: (progress: number, message: string) => void
+    onProgress: (progress: number, message: string) => void,
+    quality: 'full' | 'preview' = 'full'
 ): Promise<void> => {
     
     await loadFfmpeg((message) => onProgress(0, message));
@@ -45,14 +47,12 @@ export const exportVideo = async (
     const totalDuration = editDecisionList.reduce((acc, d) => acc + d.duration, 0);
 
     ffmpeg.on('progress', ({ progress, time }: { progress: number, time: number }) => {
-        // Ensure progress doesn't exceed 100% due to ffmpeg's time reporting
         const calculatedProgress = Math.min(1, time / totalDuration);
-        onProgress(calculatedProgress, `Rendering video...`);
+        onProgress(calculatedProgress, quality === 'preview' ? `Rendering preview...` : `Rendering video...`);
     });
 
     onProgress(0, 'Preparing media files...');
 
-    // 1. De-duplicate video files using a robust key to handle different files with the same name.
     const uniqueFiles = new Map<string, File>();
     videoFiles.forEach(file => {
         const id = `${file.name}-${file.lastModified}-${file.size}`;
@@ -62,77 +62,90 @@ export const exportVideo = async (
     });
     const uniqueVideoFilesArray = Array.from(uniqueFiles.values());
 
-    // Write audio to ffmpeg's virtual file system
-    await ffmpeg.writeFile(audioFile.name, await FFmpegUtil.fetchFile(audioFile));
+    const audioVirtualName = 'audio.mp3';
+    await ffmpeg.writeFile(audioVirtualName, await FFmpegUtil.fetchFile(audioFile));
     
-    // 2. Write unique video files to FFmpeg's virtual FS with unique names to avoid collisions.
     const uniqueIdToVirtualNameMap = new Map<string, string>();
     for (let i = 0; i < uniqueVideoFilesArray.length; i++) {
         const file = uniqueVideoFilesArray[i];
         const id = `${file.name}-${file.lastModified}-${file.size}`;
-        const virtualName = `input${i}.mp4`; // e.g., input0.mp4, input1.mp4
+        const virtualName = `input${i}.mp4`;
         uniqueIdToVirtualNameMap.set(id, virtualName);
         onProgress(0, `Loading clip: ${file.name}`);
         await ffmpeg.writeFile(virtualName, await FFmpegUtil.fetchFile(file));
     }
 
-
     const inputs: string[] = [];
-    const filterComplex: string[] = [];
+    let filterComplex: string[] = [];
     let concatInputs = '';
 
-    // Audio is the first input
-    inputs.push('-i', audioFile.name);
-
-    // Add each unique video file as an input using its virtual name
-    uniqueVideoFilesArray.forEach(file => {
-        const id = `${file.name}-${file.lastModified}-${file.size}`;
-        const virtualName = uniqueIdToVirtualNameMap.get(id)!;
-        inputs.push('-i', virtualName);
-    });
+    inputs.push('-i', audioVirtualName);
+    uniqueVideoFilesArray.forEach((_, i) => inputs.push('-i', `input${i}.mp4`));
     
-    // Create a map from the robust key to the ffmpeg stream index.
     const uniqueIdToStreamIndexMap = new Map<string, number>();
     uniqueVideoFilesArray.forEach((file, index) => {
         const id = `${file.name}-${file.lastModified}-${file.size}`;
         uniqueIdToStreamIndexMap.set(id, index + 1); // +1 because audio is stream 0
     });
 
-    // 3. Build the filter_complex command using the correct stream indexes.
     editDecisionList.forEach((decision, index) => {
         const originalFile = videoFiles[decision.clipIndex];
         const id = `${originalFile.name}-${originalFile.lastModified}-${originalFile.size}`;
         const videoStreamIndex = uniqueIdToStreamIndexMap.get(id)!;
         
-        filterComplex.push(`[${videoStreamIndex}:v]trim=duration=${decision.duration},setpts=PTS-STARTPTS[v${index}]`);
-        concatInputs += `[v${index}]`;
+        let streamName = `[${videoStreamIndex}:v]`;
+        let trimmedStreamName = `[v${index}]`;
+
+        if (quality === 'preview') {
+            const scaledStreamName = `[scaled_v${index}]`;
+            filterComplex.push(`${streamName}scale=1280:-2,trim=duration=${decision.duration},setpts=PTS-STARTPTS${scaledStreamName}`);
+            trimmedStreamName = scaledStreamName;
+        } else {
+            filterComplex.push(`${streamName}trim=duration=${decision.duration},setpts=PTS-STARTPTS${trimmedStreamName}`);
+        }
+        concatInputs += trimmedStreamName;
     });
     
-    // Concatenate all trimmed video parts and set a compatible pixel format
     filterComplex.push(`${concatInputs}concat=n=${editDecisionList.length}:v=1:a=0,format=yuv420p[outv]`);
     
-    const command = [
+    const baseCommand = [
         ...inputs,
         '-filter_complex', filterComplex.join(';'),
-        '-map', '[outv]',    // Map the final video stream
-        '-map', '0:a',    // Map the audio from the first input file
-        '-c:v', 'libx264',
+        '-map', '[outv]',
+        '-map', '0:a',
         '-c:a', 'aac',
-        '-shortest',      // Finish encoding when the shortest input stream ends (the audio)
-        'output.mp4'
+        '-shortest',
     ];
 
-    onProgress(0, 'Starting final render...');
-    await ffmpeg.exec(...command);
+    const qualitySettings = quality === 'preview'
+        ? ['-c:v', 'libx264', '-preset', 'fast', '-b:v', '2M']
+        : ['-c:v', 'libx264', '-preset', 'medium'];
+
+    const command = [...baseCommand, ...qualitySettings, 'output.mp4'];
+
+    onProgress(0, `Starting ${quality} render...`);
+    try {
+        await ffmpeg.exec(...command);
+    } catch (e) {
+        console.error("FFMPEG exec error:", e);
+        throw new Error(`FFMPEG failed. This can happen due to high memory usage with many or large clips. Error: ${e instanceof Error ? e.message : 'Unknown FFMPEG error'}`);
+    }
     onProgress(1, 'Render complete! Preparing download...');
 
     const data = await ffmpeg.readFile('output.mp4');
     
+    // Cleanup virtual files to free up memory
+    await ffmpeg.deleteFile(audioVirtualName);
+    for (const virtualName of uniqueIdToVirtualNameMap.values()) {
+        await ffmpeg.deleteFile(virtualName);
+    }
+    await ffmpeg.deleteFile('output.mp4');
+
     const url = URL.createObjectURL(new Blob([(data as Uint8Array).buffer], { type: 'video/mp4' }));
 
     const a = document.createElement('a');
     a.href = url;
-    a.download = `ai-music-video.mp4`;
+    a.download = `ai-music-video-${quality}.mp4`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

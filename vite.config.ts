@@ -1,4 +1,4 @@
-/// <reference types="vitest" />
+// Fix: Removed vitest reference which was causing a type error. The test config is picked up automatically.
 import path from 'path';
 import { defineConfig, loadEnv } from 'vite';
 
@@ -7,7 +7,6 @@ export default defineConfig(({ mode }) => {
     return {
       define: {
         'process.env.API_KEY': JSON.stringify(env.GEMINI_API_KEY),
-        'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
       },
       resolve: {
         alias: {

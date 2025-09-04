@@ -9,7 +9,9 @@ import ClipLibraryView from './components/ClipLibraryView';
 import { getClipMetadata } from './utils/video';
 import { createVideoSequence } from './services/geminiService';
 import * as db from './services/dbService';
-import { analyzeVideoContent, terminateWorker } from './services/videoAnalysisService';
+import { analyzeVideoContent, terminateWorker as terminateVideoWorker } from './services/videoAnalysisService';
+import { terminateWorker as terminateAudioWorker } from './services/audioAnalysisWorkerService';
+import { AnalysisQueue, CancellableTask } from './services/analysisQueue';
 import type { GeneratedVideo, ClipMetadata, AudioAnalysis, VideoAnalysis, CreativeRationale } from './types';
 import { LogoIcon } from './components/icons/LogoIcon';
 
@@ -30,19 +32,23 @@ const App: React.FC = () => {
   const [view, setView] = useState<AppView>(AppView.CREATE);
   const [step, setStep] = useState<CreateStep>(CreateStep.AUDIO_UPLOAD);
   const [isInitialized, setIsInitialized] = useState(false);
-  const [isProcessingClips, setIsProcessingClips] = useState(false);
-
+  const [processingMessage, setProcessingMessage] = useState<string>('');
+  
   // Creation flow state
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [audioAnalysis, setAudioAnalysis] = useState<AudioAnalysis | null>(null);
   const [musicDescription, setMusicDescription] = useState<string>('');
-  const [videoFiles, setVideoFiles] = useState<File[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   // App-wide state
   const [history, setHistory] = useState<GeneratedVideo[]>([]);
   const [clipLibrary, setClipLibrary] = useState<ClipMetadata[]>([]);
   const [currentPreview, setCurrentPreview] = useState<GeneratedVideo | null>(null);
+  
+  // A queue to limit concurrent analysis tasks to 2, preventing browser crashes.
+  const [analysisQueue] = useState(() => new AnalysisQueue(2));
+  // A map to hold the cancel functions for ongoing analysis tasks.
+  const [cancellableTasks, setCancellableTasks] = useState(new Map<string, () => boolean>());
 
   useEffect(() => {
     // On app start, load everything from the database
@@ -65,9 +71,11 @@ const App: React.FC = () => {
     
     // Clean up the analysis worker when the app unmounts
     return () => {
-        terminateWorker();
+        terminateVideoWorker();
+        terminateAudioWorker();
+        analysisQueue.clearPending();
     }
-  }, []);
+  }, [analysisQueue]);
 
 
   const handleAudioSubmit = (file: File, description: string, analysis: AudioAnalysis) => {
@@ -78,58 +86,156 @@ const App: React.FC = () => {
   };
 
   const handleClipsAdded = useCallback(async (newFiles: File[]) => {
-    setIsProcessingClips(true);
     setError(null);
-    const existingIds = new Set(clipLibrary.map(c => c.id));
-    const trulyNewFiles = newFiles.filter(f => !existingIds.has(`${f.name}-${f.lastModified}-${f.size}`));
+    const existingClipMap = new Map(clipLibrary.map(c => [c.id, c]));
+    const filesToAnalyze: File[] = [];
+
+    for (const file of newFiles) {
+        const fileId = `${file.name}-${file.lastModified}-${file.size}`;
+        const existingClip = existingClipMap.get(fileId);
+        // Only analyze if the clip is new or previously failed analysis.
+        // Skips clips that are pending, analyzing, or already ready.
+        if (!existingClip || existingClip.analysisStatus === 'error') {
+            filesToAnalyze.push(file);
+        }
+    }
     
-    if (trulyNewFiles.length > 0) {
-        try {
-            const newMetadatas = await Promise.all(trulyNewFiles.map(getClipMetadata));
+    if (filesToAnalyze.length === 0) return;
 
-            // Add clips to library immediately for UI responsiveness
-            setClipLibrary(prevLibrary => [...prevLibrary, ...newMetadatas]);
+    try {
+        // Generate metadata for all new files first
+        const newMetadatas = await Promise.all(filesToAnalyze.map(getClipMetadata));
 
-            // Perform deep content analysis and update status along the way
-            for (const metadata of newMetadatas) {
-                 // Set status to 'analyzing'
+        // Add clips to library immediately for UI responsiveness, overwriting failed ones
+        setClipLibrary(prevLibrary => {
+            const prevMap = new Map(prevLibrary.map(c => [c.id, c]));
+            newMetadatas.forEach(m => prevMap.set(m.id, m));
+            return Array.from(prevMap.values());
+        });
+
+        const analysisTasks = newMetadatas.map((metadata) => {
+            const { promise, cancel } = analysisQueue.push(async () => {
                 setClipLibrary(prev => prev.map(c => c.id === metadata.id ? { ...c, analysisStatus: 'analyzing' } : c));
                 try {
+                    const freshClip = await db.getClip(metadata.id);
+                    if (freshClip && freshClip.analysisStatus === 'ready') {
+                         setClipLibrary(prev => prev.map(c => c.id === metadata.id ? freshClip : c));
+                         return; 
+                    }
+
                     const analysis: VideoAnalysis = await analyzeVideoContent(metadata.file);
                     const enrichedMetadata = { ...metadata, analysis, analysisStatus: 'ready' as const };
                     
-                    // Update the clip in the state with analysis and 'ready' status
                     setClipLibrary(prev => prev.map(c => c.id === enrichedMetadata.id ? enrichedMetadata : c));
-                    
-                    // Add the fully analyzed clip to the DB
                     await db.addClip(enrichedMetadata);
 
                 } catch (analysisError) {
                      console.error("Error analyzing clip:", metadata.name, analysisError);
                      const errorMessage = analysisError instanceof Error ? analysisError.message : "Unknown analysis error";
-                     // Update clip with error status
-                     setClipLibrary(prev => prev.map(c => c.id === metadata.id ? { ...c, analysisStatus: 'error', analysisError: errorMessage } : c));
-                     await db.addClip({ ...metadata, analysisStatus: 'error', analysisError: errorMessage });
+                     const erroredMetadata = { ...metadata, analysisStatus: 'error' as const, analysisError: errorMessage };
+                     setClipLibrary(prev => prev.map(c => c.id === metadata.id ? erroredMetadata : c));
+                     await db.addClip(erroredMetadata);
+                } finally {
+                    setCancellableTasks(prev => {
+                        const newMap = new Map(prev);
+                        newMap.delete(metadata.id);
+                        return newMap;
+                    });
                 }
-            }
+            });
 
-        } catch (err) {
-            console.error("Error processing new clips:", err);
-            setError(err instanceof Error ? `Clip Processing Error: ${err.message}` : "Could not process one or more of your video clips. Please ensure they are not corrupted and try again.");
-        }
+            setCancellableTasks(prev => new Map(prev).set(metadata.id, cancel));
+            return promise;
+        });
+        
+        await Promise.all(analysisTasks);
+
+    } catch (err) {
+        console.error("Error processing new clips:", err);
+        setError(err instanceof Error ? `Clip Processing Error: ${err.message}` : "Could not process one or more of your video clips. Please ensure they are not corrupted and try again.");
     }
-    setIsProcessingClips(false);
-  }, [clipLibrary]);
+  }, [clipLibrary, analysisQueue]);
+  
+  const handleCancelAnalysis = useCallback((clipId: string) => {
+    const task = cancellableTasks.get(clipId);
+    if (task && task()) { // task() returns true if cancellation was successful
+        setClipLibrary(prev => prev.map(c => 
+            c.id === clipId ? { ...c, analysisStatus: 'error', analysisError: 'Analysis cancelled by user.' } : c
+        ));
+        setCancellableTasks(prev => {
+            const newMap = new Map(prev);
+            newMap.delete(clipId);
+            return newMap;
+        });
+    }
+  }, [cancellableTasks]);
 
-  const handleVideosSubmit = async (files: File[]) => {
+  const handleRetryAnalysis = useCallback((clipId: string) => {
+    const clipToRetry = clipLibrary.find(c => c.id === clipId);
+    if (clipToRetry && clipToRetry.analysisStatus === 'error') {
+        handleClipsAdded([clipToRetry.file]);
+    }
+  }, [clipLibrary, handleClipsAdded]);
+
+  const generateAndSetPreview = async (readyFiles: File[], readyClipsMetadata: ClipMetadata[]) => {
+      setError(null);
+      setProcessingMessage('');
+
+      try {
+        const { editDecisionList, creativeRationale } = await createVideoSequence(
+            musicDescription, 
+            audioAnalysis!, 
+            readyClipsMetadata,
+            (chunk) => setProcessingMessage(prev => prev + chunk)
+        );
+        
+        let thumbnail = '';
+        if (readyClipsMetadata.length > 0) {
+            if (editDecisionList.length > 0) {
+                const firstClipIndex = editDecisionList[0].clipIndex;
+                if (firstClipIndex >= 0 && firstClipIndex < readyClipsMetadata.length) {
+                    thumbnail = readyClipsMetadata[firstClipIndex].thumbnail;
+                } else {
+                    thumbnail = readyClipsMetadata[0].thumbnail;
+                }
+            } else {
+                thumbnail = readyClipsMetadata[0].thumbnail;
+            }
+        }
+
+        const newVideo: GeneratedVideo = {
+            id: new Date().toISOString(),
+            audioFile: audioFile!,
+            videoFiles: readyFiles,
+            editDecisionList,
+            creativeRationale,
+            musicDescription,
+            createdAt: new Date(),
+            thumbnail: thumbnail,
+            audioAnalysis: audioAnalysis!,
+        };
+        
+        await db.addHistory(newVideo);
+        setHistory(prev => [newVideo, ...prev.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())]);
+
+        setCurrentPreview(newVideo);
+        setStep(CreateStep.PREVIEW);
+
+      } catch (err) {
+        console.error(err);
+        setError(err instanceof Error ? `Video Generation Failed: ${err.message}` : 'An unknown error occurred during video generation. Please try again.');
+        setStep(CreateStep.VIDEO_UPLOAD);
+      }
+  }
+
+  const handleVideosSubmit = async (clipIds: string[]) => {
     if (!audioAnalysis) {
         setError("Audio analysis data is missing. Please go back and re-upload the audio.");
         return;
     }
 
     const readyClipsMetadata = clipLibrary.filter(clip => 
-      files.some(f => f.name === clip.file.name && f.lastModified === clip.file.lastModified) &&
-      clip.analysisStatus === 'ready'
+      clipIds.includes(clip.id) && clip.analysisStatus === 'ready'
     );
     
     if (readyClipsMetadata.length === 0) {
@@ -138,51 +244,8 @@ const App: React.FC = () => {
     }
 
     const readyFiles = readyClipsMetadata.map(clip => clip.file);
-
-    setVideoFiles(readyFiles);
     setStep(CreateStep.PROCESSING);
-    setError(null);
-
-    try {
-      const { editDecisionList, creativeRationale } = await createVideoSequence(musicDescription, audioAnalysis, readyClipsMetadata);
-      
-      let thumbnail = '';
-      if (readyClipsMetadata.length > 0) {
-        if (editDecisionList.length > 0) {
-            const firstClipIndex = editDecisionList[0].clipIndex;
-            if (firstClipIndex >= 0 && firstClipIndex < readyClipsMetadata.length) {
-                thumbnail = readyClipsMetadata[firstClipIndex].thumbnail;
-            } else {
-                thumbnail = readyClipsMetadata[0].thumbnail;
-            }
-        } else {
-            thumbnail = readyClipsMetadata[0].thumbnail;
-        }
-      }
-
-      const newVideo: GeneratedVideo = {
-        id: new Date().toISOString(),
-        audioFile: audioFile!,
-        videoFiles: readyFiles,
-        editDecisionList,
-        creativeRationale,
-        musicDescription,
-        createdAt: new Date(),
-        thumbnail: thumbnail,
-        audioAnalysis: audioAnalysis,
-      };
-      
-      await db.addHistory(newVideo);
-      setHistory(prev => [newVideo, ...prev]);
-
-      setCurrentPreview(newVideo);
-      setStep(CreateStep.PREVIEW);
-
-    } catch (err) {
-      console.error(err);
-      setError(err instanceof Error ? `Video Generation Failed: ${err.message}` : 'An unknown error occurred during video generation. Please try again.');
-      setStep(CreateStep.VIDEO_UPLOAD);
-    }
+    generateAndSetPreview(readyFiles, readyClipsMetadata);
   };
   
   const handleRestart = () => {
@@ -190,7 +253,6 @@ const App: React.FC = () => {
       setCurrentPreview(null);
       setAudioFile(null);
       setMusicDescription('');
-      setVideoFiles([]);
       setError(null);
       setAudioAnalysis(null);
       setView(AppView.CREATE);
@@ -207,9 +269,9 @@ const App: React.FC = () => {
       case CreateStep.AUDIO_UPLOAD:
         return <AudioUpload onSubmit={handleAudioSubmit} />;
       case CreateStep.VIDEO_UPLOAD:
-        return <VideoUpload onSubmit={handleVideosSubmit} onBack={() => setStep(CreateStep.AUDIO_UPLOAD)} onClipsAdded={handleClipsAdded} clipLibrary={clipLibrary} />;
+        return <VideoUpload onSubmit={handleVideosSubmit} onBack={() => setStep(CreateStep.AUDIO_UPLOAD)} onClipsAdded={handleClipsAdded} clipLibrary={clipLibrary} onCancelAnalysis={handleCancelAnalysis} onRetryAnalysis={handleRetryAnalysis} />;
       case CreateStep.PROCESSING:
-        return <ProcessingScreen />;
+        return <ProcessingScreen message={processingMessage} />;
       case CreateStep.PREVIEW:
         return currentPreview ? (
           <PreviewPlayer
@@ -225,19 +287,12 @@ const App: React.FC = () => {
   };
   
   const renderView = () => {
-      if (!isInitialized) {
-        return (
-             <div className="flex flex-col items-center justify-center p-8 text-center">
-                <LogoIcon className="w-16 h-16 text-brand-cyan animate-pulse"/>
-                <p className="mt-4 text-gray-400">Loading your creative workspace...</p>
-             </div>
-        )
-      }
       switch(view) {
           case AppView.HISTORY:
               return <HistoryView history={history} onSelectVideo={handleViewHistoryItem} />;
           case AppView.CLIP_LIBRARY:
-              return <ClipLibraryView clips={clipLibrary} onAddClips={handleClipsAdded} isProcessing={isProcessingClips}/>;
+              const isProcessingClips = cancellableTasks.size > 0;
+              return <ClipLibraryView clips={clipLibrary} onAddClips={handleClipsAdded} isProcessing={isProcessingClips} onCancelAnalysis={handleCancelAnalysis} onRetryAnalysis={handleRetryAnalysis}/>;
           case AppView.CREATE:
           default:
               return (
@@ -256,6 +311,18 @@ const App: React.FC = () => {
         {children}
     </button>
   )
+
+  if (!isInitialized) {
+    return (
+        <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-4">
+             <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-gray-900 to-brand-purple/20 z-0"></div>
+             <div className="flex flex-col items-center text-center z-10">
+                <LogoIcon className="w-16 h-16 text-brand-cyan animate-pulse"/>
+                <p className="mt-4 text-gray-400 text-lg">Loading your creative workspace...</p>
+             </div>
+        </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center p-4 font-sans relative overflow-hidden">

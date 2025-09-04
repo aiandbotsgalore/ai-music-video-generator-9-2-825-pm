@@ -60,7 +60,7 @@ export interface GeneratedVideo {
   createdAt: Date;
   thumbnail: string; // base64 string
   audioAnalysis: AudioAnalysis;
-  creativeRationale?: CreativeRationale;
+  creativeRationale: CreativeRationale;
 }
 
 export interface ClipMetadata {
