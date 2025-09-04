@@ -132,6 +132,14 @@ OUTPUT REQUIREMENTS:
 `;
 };
 
+/**
+ * Generates a video sequence using the Gemini API based on audio and video analysis.
+ * @param musicDescription A textual description of the music's vibe.
+ * @param audioAnalysis The analysis results for the audio file.
+ * @param clips An array of metadata for the available video clips.
+ * @param onProgress A callback function to stream progress updates.
+ * @returns A promise that resolves with the edit decision list and creative rationale.
+ */
 export const createVideoSequence = async (
   musicDescription: string,
   audioAnalysis: AudioAnalysis,
@@ -250,6 +258,11 @@ export const createVideoSequence = async (
   }
 };
 
+/**
+ * Uses the Gemini API to generate a textual description of an audio file.
+ * @param audioFile The audio file to analyze.
+ * @returns A promise that resolves with a one-sentence description of the music's vibe.
+ */
 export const describeMusic = async (audioFile: File): Promise<string> => {
   const genAI = getGenAI();
   const base64Audio = await fileToBase64(audioFile);
@@ -264,20 +277,18 @@ export const describeMusic = async (audioFile: File): Promise<string> => {
   const prompt = `Analyze this audio file and provide a concise, evocative description of its mood, genre, and tempo. Keep it to one sentence. Example: "Energetic hyper-pop with a fast beat, perfect for quick cuts and flashy visuals."`;
 
   try {
-    const call = genAI.models.generateContent({
+    const response = await genAI.models.generateContent({
       model,
       contents: { parts: [{ text: prompt }, audioPart] },
       config: { maxOutputTokens: 256 },
     });
 
-    const response = await call;
-    // Fix: The 'text' property on GenerateContentResponse is a non-nullable string.
-    const text = response.text.trim();
-    if (!text) {
+    const text = response.text;
+    if (!text || !text.trim()) {
       console.error("AI response for audio description was empty or missing. Full response object:", JSON.stringify(response, null, 2));
       throw new Error("AI returned an empty description. This could be due to safety filters.");
     }
-    return text;
+    return text.trim();
   } catch (err) {
     console.error("Error calling AI for audio description:", err instanceof Error ? err.message : err);
     if (err instanceof Error && err.message.toLowerCase().includes("safety")) {

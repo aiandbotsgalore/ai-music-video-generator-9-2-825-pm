@@ -11,6 +11,29 @@ import type { VideoAnalysis } from '../types';
 
 const WORKER_TIMEOUT_MS = 30000; // 30s timeout per analysis task
 
+/**
+ * Calculates the motion level between two image data frames.
+ * This function is exported for testing purposes.
+ * @param {ImageData} frame1 The first image data.
+ * @param {ImageData} frame2 The second image data.
+ * @returns {'static' | 'low' | 'medium' | 'high'} The calculated motion level.
+ */
+export function calculateMotionFromImageData(frame1: any, frame2: any) {
+  const data1 = frame1.data;
+  const data2 = frame2.data;
+  let diff = 0;
+  for (let i = 0; i < data1.length; i += 4) {
+    const r1 = data1[i], g1 = data1[i + 1], b1 = data1[i + 2];
+    const r2 = data2[i], g2 = data2[i + 1], b2 = data2[i + 2];
+    diff += Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+  }
+  const motionScore = (diff / (data1.length * 0.75 * 255));
+  if (motionScore > 0.1) return 'high';
+  if (motionScore > 0.03) return 'medium';
+  if (motionScore > 0.005) return 'low';
+  return 'static';
+}
+
 // Worker code (runs in dedicated Worker)
 const workerCode = `
 self.importScripts(
@@ -18,6 +41,9 @@ self.importScripts(
   'https://unpkg.com/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js',
   'https://unpkg.com/@tensorflow-models/blazeface@0.1.0/dist/blazeface.min.js'
 );
+
+// The function is injected here as a string.
+${calculateMotionFromImageData.toString()}
 
 let objectModel = null;
 let faceModel = null;
@@ -88,37 +114,18 @@ function classifyObjects(objects) {
     return 'other';
 }
 
-function calculateMotionFromImageData(frame1, frame2) {
-  const data1 = frame1.data;
-  const data2 = frame2.data;
-  let diff = 0;
-  for (let i = 0; i < data1.length; i += 4) {
-    const r1 = data1[i], g1 = data1[i + 1], b1 = data1[i + 2];
-    const r2 = data2[i], g2 = data2[i + 1], b2 = data2[i + 2];
-    diff += Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
-  }
-  const numPixels = data1.length / 4;
-  const maxDiff = numPixels * 3 * 255;
-  const motionScore = diff / maxDiff;
-
-  if (motionScore > 0.1) return 'high';
-  if (motionScore > 0.03) return 'medium';
-  if (motionScore > 0.005) return 'low';
-  return 'static';
-}
-
 self.onmessage = async (event) => {
-  const { bitmaps, fileId } = event.data;
+  const { imageBitmaps, fileId } = event.data;
   try {
     await loadModels();
 
-    if (!bitmaps || bitmaps.length === 0) {
+    if (!imageBitmaps || imageBitmaps.length === 0) {
       throw new Error('No frames provided to worker.');
     }
 
     // Use OffscreenCanvas to get ImageData and to feed tf.fromPixels when needed
-    const centralIndex = Math.floor(bitmaps.length / 2);
-    const centralBitmap = bitmaps[centralIndex];
+    const centralIndex = Math.floor(imageBitmaps.length / 2);
+    const centralBitmap = imageBitmaps[centralIndex];
     const width = centralBitmap.width;
     const height = centralBitmap.height;
 
@@ -138,7 +145,7 @@ self.onmessage = async (event) => {
     const detectedObjects = objectPredictions.map(p => ({ class: p.class, score: p.score }));
 
     // Calculate metrics across frames
-    const brightnessSum = bitmaps.reduce((sum, bmp) => {
+    const brightnessSum = imageBitmaps.reduce((sum, bmp) => {
       const c = new OffscreenCanvas(bmp.width, bmp.height);
       const ct = c.getContext('2d');
       ct.drawImage(bmp, 0, 0, bmp.width, bmp.height);
@@ -146,14 +153,14 @@ self.onmessage = async (event) => {
       return sum + analyzeBrightnessFromImageData(id);
     }, 0);
 
-    const avgBrightness = brightnessSum / bitmaps.length;
+    const avgBrightness = brightnessSum / imageBitmaps.length;
     const visualComplexity = analyzeSobel(centralImageData);
 
     // Motion: compare first and last frames if available
     let motionLevel = 'static';
-    if (bitmaps.length > 1) {
-      const first = bitmaps[0];
-      const last = bitmaps[bitmaps.length - 1];
+    if (imageBitmaps.length > 1) {
+      const first = imageBitmaps[0];
+      const last = imageBitmaps[imageBitmaps.length - 1];
 
       // get imageData for first & last
       const c1 = new OffscreenCanvas(first.width, first.height);
@@ -171,7 +178,7 @@ self.onmessage = async (event) => {
 
     // cleanup transferable ImageBitmaps
     try {
-      bitmaps.forEach(b => {
+      imageBitmaps.forEach(b => {
         if (b && typeof b.close === 'function') {
           b.close();
         }
@@ -270,6 +277,9 @@ function createWorkerInstance() {
   }
 }
 
+/**
+ * Terminates the video analysis worker and rejects any pending tasks.
+ */
 export function terminateWorker() {
   if (worker) {
     try {
@@ -286,7 +296,12 @@ export function terminateWorker() {
   runningTasks.clear();
 }
 
-// Helper: extract frames on main thread and create transferable ImageBitmap(s)
+/**
+ * Extracts frames from a video file at specified times and returns them as ImageBitmaps.
+ * @param {File} file The video file to extract frames from.
+ * @param {number[]} frameTimes An array of timestamps (in seconds) to extract frames at.
+ * @returns {Promise<ImageBitmap[]>} A promise that resolves to an array of ImageBitmap objects.
+ */
 async function extractFramesAsImageBitmaps(file: File, frameTimes: number[]): Promise<ImageBitmap[]> {
   return new Promise(async (resolve, reject) => {
     const video = document.createElement('video');
@@ -348,6 +363,12 @@ async function extractFramesAsImageBitmaps(file: File, frameTimes: number[]): Pr
   });
 }
 
+/**
+ * Analyzes the content of a video file by extracting frames and sending them to a web worker for processing.
+ * This function is optimized to extract fewer frames for short videos.
+ * @param {File} file The video file to analyze.
+ * @returns {Promise<VideoAnalysis>} A promise that resolves to the video analysis results.
+ */
 export async function analyzeVideoContent(file: File): Promise<VideoAnalysis> {
   const fileId = `${file.name}-${file.lastModified}-${file.size}`;
 
@@ -389,8 +410,8 @@ export async function analyzeVideoContent(file: File): Promise<VideoAnalysis> {
   runningTasks.set(fileId, task);
 
   (async () => {
-    let bitmaps: ImageBitmap[] = [];
     try {
+      // Load video metadata on main thread to compute frame times
       const videoForMeta = document.createElement('video');
       videoForMeta.preload = 'metadata';
       videoForMeta.src = URL.createObjectURL(file);
@@ -401,23 +422,27 @@ export async function analyzeVideoContent(file: File): Promise<VideoAnalysis> {
       const duration = videoForMeta.duration;
       URL.revokeObjectURL(videoForMeta.src);
 
-      let frameTimes = [0.2 * duration, 0.5 * duration, 0.8 * duration].filter(t => t > 0.05 && t < duration - 0.05);
+      // Choose frame times based on video duration
+      let frameTimes;
+      if (duration < 10) {
+        // For short videos, take two frames to allow for motion analysis
+        frameTimes = [duration * 0.25, duration * 0.75];
+      } else {
+        // For longer videos, take three frames
+        frameTimes = [0.2 * duration, 0.5 * duration, 0.8 * duration];
+      }
+      frameTimes = frameTimes.filter(t => t > 0.05 && t < duration - 0.05);
       if (frameTimes.length === 0) {
         frameTimes = [Math.min(0.2, duration / 2)];
       }
 
-      bitmaps = await extractFramesAsImageBitmaps(file, frameTimes);
-      
-      try {
-        // Send ImageBitmaps to worker (transferable)
-        workerInstance.postMessage({ bitmaps, fileId }, bitmaps);
-      } catch(e) {
-        // If postMessage fails (e.g., transfer error), close bitmaps on main thread.
-        bitmaps.forEach(b => b.close && b.close());
-        throw e; // re-throw the error to be caught by the outer catch block
-      }
 
-      // The worker will resolve the promise via the onmessage handler.
+      const bitmaps = await extractFramesAsImageBitmaps(file, frameTimes);
+
+      // Send ImageBitmaps to worker (transferable)
+      workerInstance.postMessage({ imageBitmaps: bitmaps, fileId }, bitmaps);
+
+      // the worker will resolve via onmessage
     } catch (err) {
       if (task.timeoutId) clearTimeout(task.timeoutId);
       runningTasks.delete(fileId);
